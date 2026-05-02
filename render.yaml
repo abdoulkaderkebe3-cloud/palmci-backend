@@ -14,7 +14,7 @@ services:
       - key: GEE_KEY_FILE
         value: ./gee_key.json
       - key: GEE_KEY_JSON
-        sync: false  # à remplir manuellement sur Render
+        sync: false
 
 databases:
   - name: palmci-db
