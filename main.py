@@ -1,18 +1,66 @@
-from fastapi import FastAPI
-import ee
+import json
 import os
-import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # ============================================
-# Initialiser Google Earth Engine
+# Recréer gee_key.json depuis variable d'env
+# (nécessaire sur Render car fichier non commité)
 # ============================================
-ee.Initialize(project='paml-ci')
+gee_key_json = os.getenv("GEE_KEY_JSON")
+gee_key_file = os.getenv("GEE_KEY_FILE", "./gee_key.json")
+
+if gee_key_json and not os.path.exists(gee_key_file):
+    with open(gee_key_file, "w") as f:
+        f.write(gee_key_json)
+    print("✅ gee_key.json recréé depuis GEE_KEY_JSON")
+
+# ============================================
+# Initialiser GEE avec Service Account
+# ============================================
+import ee
+
+GEE_SERVICE_ACCOUNT = os.getenv("GEE_SERVICE_ACCOUNT", "palmci-gee@paml-ci.iam.gserviceaccount.com")
+
+credentials = ee.ServiceAccountCredentials(GEE_SERVICE_ACCOUNT, gee_key_file)
+ee.Initialize(credentials)
+print("✅ GEE initialisé")
+
+# ============================================
+# Imports FastAPI
+# ============================================
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from sqlalchemy import and_
+from datetime import datetime
+
+from app.core.database import init_db, get_db, AnalyseNDVI, ImageSatellite, Prescription
+
+# ============================================
+# Init DB au démarrage
+# ============================================
+init_db()
+
+# ============================================
+# App FastAPI
+# ============================================
 app = FastAPI(
     title="PALMCI NDVI API",
     description="Analyse satellitaire NDVI — Groupe SIFCA",
-    version="1.0.0"
+    version="2.0.0"
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ============================================
-# Les 8 sites PALMCI
+# Constantes
 # ============================================
 SITES = [
     {"id": 1, "nom": "EHANIA",     "bbox": [-3.092651, 5.197629, -2.933693, 5.368220]},
@@ -24,38 +72,36 @@ SITES = [
     {"id": 7, "nom": "GBAPET",     "bbox": [-7.5611,   4.9223,   -7.4611,   5.0223  ]},
     {"id": 8, "nom": "NEKA",       "bbox": [-7.5626,   4.5156,   -7.4626,   4.6156  ]},
 ]
+
+PERIODES = {
+    "2023": {"debut": "2022-11-01", "fin": "2023-02-28"},
+    "2024": {"debut": "2023-11-01", "fin": "2024-02-28"},
+    "2025": {"debut": "2024-11-01", "fin": "2025-02-28"},
+}
+
 # ============================================
-# Classifier NDVI → Zone prescription
+# Helpers
 # ============================================
 def classify_zone(ndvi: float) -> dict:
     if ndvi < 0.35:
         return {
-            "zone": 1,
-            "label": "Stress sévère",
-            "dose": "DOSE_MAX",
-            "couleur": "#e74c3c",
+            "zone": 1, "label": "Stress sévère",
+            "dose": "DOSE_MAX", "couleur": "#e74c3c",
             "action": "Intervention urgente — apport NPK renforcé"
         }
     elif ndvi < 0.55:
         return {
-            "zone": 2,
-            "label": "Stress modéré",
-            "dose": "DOSE_STANDARD",
-            "couleur": "#f39c12",
+            "zone": 2, "label": "Stress modéré",
+            "dose": "DOSE_STANDARD", "couleur": "#f39c12",
             "action": "Dose standard — surveillance mensuelle"
         }
     else:
-            return {
-        
-            "zone": 3,
-            "label": "Végétation saine",
-            "dose": "DOSE_REDUITE",
-            "couleur": "#27ae60",
+        return {
+            "zone": 3, "label": "Végétation saine",
+            "dose": "DOSE_REDUITE", "couleur": "#27ae60",
             "action": "Réduire les apports — palmiers en bon état"
         }
-# ============================================
-# Prescription selon âge du palmier
-# ============================================
+
 def get_engrais_par_age(age: int, zone: int) -> dict:
     if age < 5:
         type_engrais = "NPK 15-15-15 (croissance)"
@@ -64,39 +110,178 @@ def get_engrais_par_age(age: int, zone: int) -> dict:
     else:
         type_engrais = "KCl + MgSO4 (maintien)"
     doses = {1: "dose maximale", 2: "dose standard", 3: "dose réduite"}
-    return {
-        "age_palmier": age,
-        "type_engrais": type_engrais,
-        "dose": doses.get(zone, "dose standard")
-    }
+    return {"type_engrais": type_engrais, "dose": doses.get(zone, "dose standard")}
+
 # ============================================
-# ENDPOINT 1 — Racine
+# Calcul GEE — NDVI complet
+# ============================================
+def calculer_ndvi_gee(site: dict, date_debut: str, date_fin: str) -> dict:
+    zone = ee.Geometry.Rectangle(site["bbox"])
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterDate(date_debut, date_fin)
+        .filterBounds(zone)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+    )
+    nb_images = s2.size().getInfo()
+    if nb_images == 0:
+        return None
+
+    composite = s2.map(lambda img: img.addBands(
+        img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+    )).median().clip(zone)
+
+    ndvi = composite.select("NDVI")
+
+    # Stats NDVI (mean, min, max)
+    stats = ndvi.reduceRegion(
+        reducer=ee.Reducer.mean()
+            .combine(ee.Reducer.min(), sharedInputs=True)
+            .combine(ee.Reducer.max(), sharedInputs=True),
+        geometry=zone, scale=10, maxPixels=1e9
+    ).getInfo()
+
+    # Zones prescription + superficies en hectares
+    zones_img = ndvi.expression(
+        "(ndvi < 0.40) ? 1 : (ndvi < 0.60) ? 2 : 3",
+        {"ndvi": ndvi}
+    ).rename("zone")
+    pixel_area = ee.Image.pixelArea().divide(1e4)
+    z1 = pixel_area.updateMask(zones_img.eq(1)).reduceRegion(
+        reducer=ee.Reducer.sum(), geometry=zone, scale=10, maxPixels=1e9
+    ).getInfo()
+    z2 = pixel_area.updateMask(zones_img.eq(2)).reduceRegion(
+        reducer=ee.Reducer.sum(), geometry=zone, scale=10, maxPixels=1e9
+    ).getInfo()
+    z3 = pixel_area.updateMask(zones_img.eq(3)).reduceRegion(
+        reducer=ee.Reducer.sum(), geometry=zone, scale=10, maxPixels=1e9
+    ).getInfo()
+
+    ndvi_moyen = round(stats.get("NDVI_mean") or 0, 4)
+    zone_info  = classify_zone(ndvi_moyen)
+
+    return {
+        "ndvi_moyen": ndvi_moyen,
+        "ndvi_min":   round(stats.get("NDVI_min") or 0, 4),
+        "ndvi_max":   round(stats.get("NDVI_max") or 0, 4),
+        "zone1_ha":   round(z1.get("area") or 0, 2),
+        "zone2_ha":   round(z2.get("area") or 0, 2),
+        "zone3_ha":   round(z3.get("area") or 0, 2),
+        "zone_num":   zone_info["zone"],
+        "zone_label": zone_info["label"],
+        "dose":       zone_info["dose"],
+        "couleur":    zone_info["couleur"],
+        "action":     zone_info["action"],
+        "nb_images":  nb_images,
+        "composite":  composite,
+        "zone_img":   zones_img,
+        "geometry":   zone,
+    }
+
+# ============================================
+# Calcul GEE — URLs images satellites
+# ============================================
+def calculer_images_gee(composite, zones_img, zone) -> dict:
+    url_rgb = composite.select(["B4", "B3", "B2"]).getThumbURL({
+        "min": 0, "max": 3000, "dimensions": 512,
+        "region": zone, "format": "png"
+    })
+    url_ndvi = composite.select("NDVI").getThumbURL({
+        "min": 0, "max": 1, "dimensions": 512,
+        "region": zone, "format": "png",
+        "palette": ["red", "yellow", "green"]
+    })
+    url_infrarouge = composite.select(["B8", "B4", "B3"]).getThumbURL({
+        "min": 0, "max": 4000, "dimensions": 512,
+        "region": zone, "format": "png"
+    })
+    url_prescription = zones_img.getThumbURL({
+        "min": 1, "max": 3, "dimensions": 512,
+        "region": zone, "format": "png",
+        "palette": ["#e74c3c", "#f39c12", "#27ae60"]
+    })
+    return {
+        "url_rgb":          url_rgb,
+        "url_ndvi":         url_ndvi,
+        "url_infrarouge":   url_infrarouge,
+        "url_prescription": url_prescription,
+    }
+
+# ============================================
+# Sauvegarde DB — NDVI
+# ============================================
+def sauvegarder_ndvi(db: Session, site: dict, annee: str, date_debut: str, date_fin: str, data: dict):
+    existing = db.query(AnalyseNDVI).filter(
+        and_(AnalyseNDVI.site_id == site["id"], AnalyseNDVI.annee == annee)
+    ).first()
+    champs = {k: data[k] for k in [
+        "ndvi_moyen", "ndvi_min", "ndvi_max",
+        "zone1_ha", "zone2_ha", "zone3_ha",
+        "zone_num", "zone_label", "dose",
+        "couleur", "action", "nb_images"
+    ]}
+    if existing:
+        for key, val in champs.items():
+            setattr(existing, key, val)
+        existing.date_calcul = datetime.utcnow()
+    else:
+        db.add(AnalyseNDVI(
+            site_id=site["id"], site_nom=site["nom"],
+            annee=annee, date_debut=date_debut, date_fin=date_fin,
+            **champs
+        ))
+    db.commit()
+
+# ============================================
+# Sauvegarde DB — Images
+# ============================================
+def sauvegarder_images(db: Session, site: dict, annee: str, date_debut: str, date_fin: str, urls: dict):
+    existing = db.query(ImageSatellite).filter(
+        and_(ImageSatellite.site_id == site["id"], ImageSatellite.annee == annee)
+    ).first()
+    if existing:
+        existing.url_rgb          = urls["url_rgb"]
+        existing.url_ndvi         = urls["url_ndvi"]
+        existing.url_infrarouge   = urls["url_infrarouge"]
+        existing.url_prescription = urls["url_prescription"]
+        existing.date_calcul      = datetime.utcnow()
+    else:
+        db.add(ImageSatellite(
+            site_id=site["id"], site_nom=site["nom"],
+            annee=annee, date_debut=date_debut, date_fin=date_fin,
+            **urls
+        ))
+    db.commit()
+
+# ============================================
+# ENDPOINT — Racine
 # ============================================
 @app.get("/")
 def root():
     return {
-        "projet": "PALMCI NDVI Pipeline",
-        "version": "1.0.0",
-        "status": "running",
-        "total_sites": len(SITES),
+        "projet":  "PALMCI NDVI Pipeline",
+        "version": "2.0.0",
+        "status":  "running",
         "endpoints": [
             "/api/sites",
-            "/api/sites/{site_id}",
-            "/api/ndvi/{site_id}",
-            "/api/ndvi",
-            "/api/images/{site_id}",
-            "/api/prescription/{site_id}",
-            "/docs"
+            "/api/analyse/{site_id}?annee=2025",
+            "/api/images/{site_id}?annee=2025",
+            "/api/prescription/{site_id}?annee=2025&age_palmier=10",
+            "/api/sync",
+            "/api/sync/{site_id}",
+            "/docs",
         ]
     }
+
 # ============================================
-# ENDPOINT 2 — Liste tous les sites
+# ENDPOINT — Liste tous les sites
 # ============================================
 @app.get("/api/sites")
 def get_sites():
     return {"total": len(SITES), "sites": SITES}
+
 # ============================================
-# ENDPOINT 3 — Un site par ID
+# ENDPOINT — Un site par ID
 # ============================================
 @app.get("/api/sites/{site_id}")
 def get_site(site_id: int):
@@ -104,207 +289,234 @@ def get_site(site_id: int):
     if not site:
         return {"erreur": f"Site {site_id} introuvable"}
     return site
+
 # ============================================
-# ENDPOINT 4 — NDVI d'un site
+# ENDPOINT — Analyse NDVI d'un site
+# Cache DB en priorité, sinon appel GEE
 # ============================================
-@app.get("/api/ndvi/{site_id}")
-def get_ndvi(
+@app.get("/api/analyse/{site_id}")
+def get_analyse(
     site_id: int,
-    date_debut: str = "2024-11-01",
-    date_fin: str = "2025-02-28"
+    annee: str = "2025",
+    db: Session = Depends(get_db)
 ):
     site = next((s for s in SITES if s["id"] == site_id), None)
     if not site:
         return {"erreur": f"Site {site_id} introuvable"}
-    zone = ee.Geometry.Rectangle(site["bbox"])
-    s2 = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-        .filterDate(date_debut, date_fin)
-        .filterBounds(zone)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-    )
-    nb_images = s2.size().getInfo()
-    if nb_images == 0:
-        return {"erreur": "Aucune image disponible", "site": site["nom"]}
-    def add_ndvi(img):
-        return img.addBands(
-            img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-        )
-    composite = s2.map(add_ndvi).select("NDVI").median().clip(zone)
-    stats = composite.reduceRegion(
-        reducer=ee.Reducer.mean()
-            .combine(ee.Reducer.min(), sharedInputs=True)
-            .combine(ee.Reducer.max(), sharedInputs=True),
-        geometry=zone,
-        scale=10,
-        maxPixels=1e9
-    ).getInfo()
-    ndvi_moyen = round(stats.get("NDVI_mean", 0), 4)
-    zone_info = classify_zone(ndvi_moyen)
+    if annee not in PERIODES:
+        return {"erreur": f"Année {annee} invalide. Choisir parmi : {list(PERIODES.keys())}"}
+
+    # 1. Cache DB
+    cached = db.query(AnalyseNDVI).filter(
+        and_(AnalyseNDVI.site_id == site_id, AnalyseNDVI.annee == annee)
+    ).first()
+
+    if cached:
+        return {
+            "source":      "cache",
+            "site_id":     cached.site_id,
+            "nom":         cached.site_nom,
+            "annee":       cached.annee,
+            "ndvi_moyen":  cached.ndvi_moyen,
+            "ndvi_min":    cached.ndvi_min,
+            "ndvi_max":    cached.ndvi_max,
+            "zone1_ha":    cached.zone1_ha,
+            "zone2_ha":    cached.zone2_ha,
+            "zone3_ha":    cached.zone3_ha,
+            "zone":        cached.zone_num,
+            "label":       cached.zone_label,
+            "dose":        cached.dose,
+            "couleur":     cached.couleur,
+            "action":      cached.action,
+            "nb_images":   cached.nb_images,
+            "date_calcul": cached.date_calcul,
+            "periode":     f"{cached.date_debut} → {cached.date_fin}"
+        }
+
+    # 2. GEE si pas en cache
+    periode = PERIODES[annee]
+    data = calculer_ndvi_gee(site, periode["debut"], periode["fin"])
+    if not data:
+        return {"erreur": "Aucune image satellite disponible", "site": site["nom"], "annee": annee}
+
+    sauvegarder_ndvi(db, site, annee, periode["debut"], periode["fin"], data)
+
     return {
-        "site_id": site_id,
-        "nom": site["nom"],
-        "ndvi_moyen": ndvi_moyen,
-        "ndvi_min": round(stats.get("NDVI_min", 0), 4),
-        "ndvi_max": round(stats.get("NDVI_max", 0), 4),
-        "nb_images": nb_images,
-        "zone": zone_info["zone"],
-        "label": zone_info["label"],
-        "dose_prescrite": zone_info["dose"],
-        "couleur": zone_info["couleur"],
-        "action": zone_info["action"],
-        "periode": f"{date_debut} → {date_fin}"
+        "source":     "gee",
+        "site_id":    site_id,
+        "nom":        site["nom"],
+        "annee":      annee,
+        "ndvi_moyen": data["ndvi_moyen"],
+        "ndvi_min":   data["ndvi_min"],
+        "ndvi_max":   data["ndvi_max"],
+        "zone1_ha":   data["zone1_ha"],
+        "zone2_ha":   data["zone2_ha"],
+        "zone3_ha":   data["zone3_ha"],
+        "zone":       data["zone_num"],
+        "label":      data["zone_label"],
+        "dose":       data["dose"],
+        "couleur":    data["couleur"],
+        "action":     data["action"],
+        "nb_images":  data["nb_images"],
+        "periode":    f"{periode['debut']} → {periode['fin']}"
     }
+
 # ============================================
-# ENDPOINT 5 — NDVI tous les sites
-# ============================================
-@app.get("/api/ndvi")
-def get_ndvi_all(
-    date_debut: str = "2024-11-01",
-    date_fin: str = "2025-02-28"
-):
-    results = []
-    for site in SITES:
-        try:
-            zone = ee.Geometry.Rectangle(site["bbox"])
-            s2 = (
-                ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-                .filterDate(date_debut, date_fin)
-                .filterBounds(zone)
-                .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-            )
-            nb_images = s2.size().getInfo()
-            if nb_images == 0:
-                results.append({"site_id": site["id"], "nom": site["nom"], "erreur": "Aucune image"})
-                continue
-            def add_ndvi(img):
-                return img.addBands(img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
-            composite = s2.map(add_ndvi).select("NDVI").median().clip(zone)
-            stats = composite.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=zone,
-                scale=10,
-                maxPixels=1e9
-            ).getInfo()
-            ndvi_moyen = round(stats.get("NDVI_mean", 0), 4)
-            zone_info = classify_zone(ndvi_moyen)
-            results.append({
-                "site_id": site["id"],
-                "nom": site["nom"],
-                "ndvi_moyen": ndvi_moyen,
-                "nb_images": nb_images,
-                "zone": zone_info["zone"],
-                "label": zone_info["label"],
-                "dose_prescrite": zone_info["dose"],
-                "couleur": zone_info["couleur"]
-            })
-        except Exception as e:
-            results.append({"site_id": site["id"], "nom": site["nom"], "erreur": str(e)})
-    return {"total": len(results), "resultats": results}
-# ============================================
-# ENDPOINT 6 — Images satellites d'un site
+# ENDPOINT — Images satellites d'un site
+# Cache DB en priorité, sinon appel GEE
 # ============================================
 @app.get("/api/images/{site_id}")
 def get_images(
     site_id: int,
-    date_debut: str = "2024-11-01",
-    date_fin: str = "2025-02-28"
+    annee: str = "2025",
+    db: Session = Depends(get_db)
 ):
     site = next((s for s in SITES if s["id"] == site_id), None)
     if not site:
         return {"erreur": f"Site {site_id} introuvable"}
-    zone = ee.Geometry.Rectangle(site["bbox"])
-    s2 = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-        .filterDate(date_debut, date_fin)
-        .filterBounds(zone)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-    )
-    nb_images = s2.size().getInfo()
-    if nb_images == 0:
-        return {"erreur": "Aucune image disponible"}
-    composite = s2.median().clip(zone)
-    # Image couleurs naturelles RGB
-    url_rgb = composite.select(['B4', 'B3', 'B2']).getThumbURL({
-        'min': 0, 'max': 3000,
-        'dimensions': 512,
-        'region': zone,
-        'format': 'png'
-    })
-    # Image NDVI rouge → jaune → vert
-    ndvi = composite.normalizedDifference(['B8', 'B4']).rename('NDVI')
-    url_ndvi = ndvi.getThumbURL({
-        'min': 0, 'max': 1,
-        'dimensions': 512,
-        'region': zone,
-        'palette': ['red', 'yellow', 'green'],
-        'format': 'png'
-    })
-    # Image infrarouge fausses couleurs
-    url_infrarouge = composite.select(['B8', 'B4', 'B3']).getThumbURL({
-        'min': 0, 'max': 3000,
-        'dimensions': 512,
-        'region': zone,
-        'format': 'png'
-    })
+    if annee not in PERIODES:
+        return {"erreur": f"Année {annee} invalide"}
+
+    # 1. Cache DB
+    cached = db.query(ImageSatellite).filter(
+        and_(ImageSatellite.site_id == site_id, ImageSatellite.annee == annee)
+    ).first()
+
+    if cached:
+        return {
+            "source":      "cache",
+            "site_id":     site_id,
+            "nom":         site["nom"],
+            "annee":       annee,
+            "images": {
+                "rgb":          cached.url_rgb,
+                "ndvi":         cached.url_ndvi,
+                "infrarouge":   cached.url_infrarouge,
+                "prescription": cached.url_prescription,
+            },
+            "date_calcul": cached.date_calcul,
+        }
+
+    # 2. GEE si pas en cache
+    periode = PERIODES[annee]
+    data = calculer_ndvi_gee(site, periode["debut"], periode["fin"])
+    if not data:
+        return {"erreur": "Aucune image disponible", "site": site["nom"], "annee": annee}
+
+    urls = calculer_images_gee(data["composite"], data["zone_img"], data["geometry"])
+    sauvegarder_images(db, site, annee, periode["debut"], periode["fin"], urls)
+
     return {
+        "source":  "gee",
         "site_id": site_id,
-        "nom": site["nom"],
-        "nb_images": nb_images,
+        "nom":     site["nom"],
+        "annee":   annee,
         "images": {
-            "rgb": url_rgb,
-            "ndvi": url_ndvi,
-            "infrarouge": url_infrarouge
-        },
-        "periode": f"{date_debut} → {date_fin}"
+            "rgb":          urls["url_rgb"],
+            "ndvi":         urls["url_ndvi"],
+            "infrarouge":   urls["url_infrarouge"],
+            "prescription": urls["url_prescription"],
+        }
     }
+
 # ============================================
-# ENDPOINT 7 — Prescription engrais
+# ENDPOINT — Prescription engrais
 # ============================================
 @app.get("/api/prescription/{site_id}")
 def get_prescription(
     site_id: int,
+    annee: str = "2025",
     age_palmier: int = 10,
-    date_debut: str = "2024-11-01",
-    date_fin: str = "2025-02-28"
+    db: Session = Depends(get_db)
 ):
     site = next((s for s in SITES if s["id"] == site_id), None)
     if not site:
         return {"erreur": f"Site {site_id} introuvable"}
-    zone = ee.Geometry.Rectangle(site["bbox"])
-    s2 = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-        .filterDate(date_debut, date_fin)
-        .filterBounds(zone)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-    )
-    nb_images = s2.size().getInfo()
-    if nb_images == 0:
-        return {"erreur": "Aucune image disponible"}
-    def add_ndvi(img):
-        return img.addBands(img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
-    composite = s2.map(add_ndvi).select("NDVI").median().clip(zone)
-    stats = composite.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=zone,
-        scale=10,
-        maxPixels=1e9
-    ).getInfo()
-    ndvi_moyen = round(stats.get("NDVI_mean", 0), 4)
-    zone_info = classify_zone(ndvi_moyen)
-    engrais = get_engrais_par_age(age_palmier, zone_info["zone"])
+
+    # Cache DB
+    cached = db.query(AnalyseNDVI).filter(
+        and_(AnalyseNDVI.site_id == site_id, AnalyseNDVI.annee == annee)
+    ).first()
+
+    if cached:
+        ndvi_moyen = cached.ndvi_moyen
+        zone_num   = cached.zone_num
+        zone_label = cached.zone_label
+        couleur    = cached.couleur
+        action     = cached.action
+    else:
+        periode = PERIODES.get(annee, PERIODES["2025"])
+        data = calculer_ndvi_gee(site, periode["debut"], periode["fin"])
+        if not data:
+            return {"erreur": "Aucune image disponible"}
+        sauvegarder_ndvi(db, site, annee, periode["debut"], periode["fin"], data)
+        ndvi_moyen = data["ndvi_moyen"]
+        zone_num   = data["zone_num"]
+        zone_label = data["zone_label"]
+        couleur    = data["couleur"]
+        action     = data["action"]
+
+    engrais = get_engrais_par_age(age_palmier, zone_num)
+
     return {
-        "site_id": site_id,
-        "nom": site["nom"],
+        "site_id":    site_id,
+        "nom":        site["nom"],
+        "annee":      annee,
         "ndvi_moyen": ndvi_moyen,
-        "zone": zone_info["zone"],
-        "label": zone_info["label"],
-        "couleur": zone_info["couleur"],
-        "action": zone_info["action"],
+        "zone":       zone_num,
+        "label":      zone_label,
+        "couleur":    couleur,
+        "action":     action,
         "prescription": {
-            "age_palmier": age_palmier,
+            "age_palmier":  age_palmier,
             "type_engrais": engrais["type_engrais"],
-            "dose": engrais["dose"]
-        },
-        "periode": f"{date_debut} → {date_fin}"
+            "dose":         engrais["dose"],
+        }
     }
+
+# ============================================
+# ENDPOINT — Sync 1 site (toutes années)
+# ============================================
+@app.post("/api/sync/{site_id}")
+def sync_site(site_id: int, db: Session = Depends(get_db)):
+    site = next((s for s in SITES if s["id"] == site_id), None)
+    if not site:
+        return {"erreur": f"Site {site_id} introuvable"}
+
+    resultats = []
+    for annee, periode in PERIODES.items():
+        try:
+            data = calculer_ndvi_gee(site, periode["debut"], periode["fin"])
+            if not data:
+                resultats.append({"annee": annee, "status": "aucune image"})
+                continue
+            sauvegarder_ndvi(db, site, annee, periode["debut"], periode["fin"], data)
+            urls = calculer_images_gee(data["composite"], data["zone_img"], data["geometry"])
+            sauvegarder_images(db, site, annee, periode["debut"], periode["fin"], urls)
+            resultats.append({"annee": annee, "status": "ok", "ndvi": data["ndvi_moyen"]})
+        except Exception as e:
+            resultats.append({"annee": annee, "status": "erreur", "detail": str(e)})
+
+    return {"site": site["nom"], "resultats": resultats}
+
+# ============================================
+# ENDPOINT — Sync tous les sites toutes années
+# ============================================
+@app.post("/api/sync")
+def sync_all(db: Session = Depends(get_db)):
+    rapport = []
+    for site in SITES:
+        for annee, periode in PERIODES.items():
+            try:
+                data = calculer_ndvi_gee(site, periode["debut"], periode["fin"])
+                if not data:
+                    rapport.append({"site": site["nom"], "annee": annee, "status": "aucune image"})
+                    continue
+                sauvegarder_ndvi(db, site, annee, periode["debut"], periode["fin"], data)
+                urls = calculer_images_gee(data["composite"], data["zone_img"], data["geometry"])
+                sauvegarder_images(db, site, annee, periode["debut"], periode["fin"], urls)
+                rapport.append({"site": site["nom"], "annee": annee, "status": "ok", "ndvi": data["ndvi_moyen"]})
+            except Exception as e:
+                rapport.append({"site": site["nom"], "annee": annee, "status": "erreur", "detail": str(e)})
+
+    return {"total": len(rapport), "rapport": rapport}

@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: palmci-ndvi-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: palmci-db
+          property: connectionString
+      - key: GEE_SERVICE_ACCOUNT
+        value: palmci-gee@paml-ci.iam.gserviceaccount.com
+      - key: GEE_KEY_FILE
+        value: ./gee_key.json
+      - key: GEE_KEY_JSON
+        sync: false  # à remplir manuellement sur Render
+
+databases:
+  - name: palmci-db
+    plan: free
+    databaseName: palmci_db
