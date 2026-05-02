@@ -1,0 +1,24 @@
+# Framework
+fastapi
+uvicorn[standard]
+python-dotenv
+# Satellite — Copernicus / Sentinel
+sentinelsat
+requests
+# Google Earth Engine
+earthengine-api
+# Traitement images & NDVI
+numpy
+rasterio
+shapely
+geopandas
+pyproj
+# Base de données
+sqlalchemy
+asyncpg
+alembic
+psycopg2-binary
+# Export & utilitaires
+pandas
+python-multipart
+aiofiles
