@@ -1,5 +1,7 @@
 import json
 import os
+import base64
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -189,8 +191,17 @@ def calculer_ndvi_gee(site: dict, date_debut: str, date_fin: str) -> dict:
     }
 
 # ============================================
-# Calcul GEE — URLs images satellites
+# Calcul GEE — Images satellites (Base64)
 # ============================================
+def url_to_base64(url: str) -> str:
+    try:
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        return "data:image/png;base64," + base64.b64encode(response.content).decode('utf-8')
+    except Exception as e:
+        print(f"Erreur téléchargement image GEE: {e}")
+        return ""
+
 def calculer_images_gee(composite, zones_img, zone) -> dict:
     url_rgb = composite.select(["B4", "B3", "B2"]).getThumbURL({
         "min": 0, "max": 3000, "dimensions": 512,
@@ -211,10 +222,10 @@ def calculer_images_gee(composite, zones_img, zone) -> dict:
         "palette": ["#e74c3c", "#f39c12", "#27ae60"]
     })
     return {
-        "url_rgb":          url_rgb,
-        "url_ndvi":         url_ndvi,
-        "url_infrarouge":   url_infrarouge,
-        "url_prescription": url_prescription,
+        "url_rgb":          url_to_base64(url_rgb),
+        "url_ndvi":         url_to_base64(url_ndvi),
+        "url_infrarouge":   url_to_base64(url_infrarouge),
+        "url_prescription": url_to_base64(url_prescription),
     }
 
 # ============================================
@@ -393,9 +404,8 @@ def get_images(
     ).first()
 
     if cached:
-        age_heures = (datetime.utcnow() - cached.date_calcul).total_seconds() / 3600
-        if age_heures > 24:
-            # L'URL GEE expire au bout de 1 à 2 jours. On force le recalcul.
+        # Invalider si ce n'est pas du base64 (ancienne version avec URL expirées)
+        if cached.url_rgb and not cached.url_rgb.startswith("data:image"):
             cached = None
         else:
             return {
