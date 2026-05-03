@@ -118,11 +118,20 @@ def get_engrais_par_age(age: int, zone: int) -> dict:
 # ============================================
 def calculer_ndvi_gee(site: dict, date_debut: str, date_fin: str) -> dict:
     zone = ee.Geometry.Rectangle(site["bbox"])
+
+    # Fonction pour masquer les nuages et ombres via la bande SCL (Scene Classification)
+    def mask_s2_clouds(image):
+        scl = image.select('SCL')
+        # 3: ombres de nuages, 8: nuages moyens, 9: nuages forts, 10: cirrus
+        mask = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10))
+        return image.updateMask(mask)
+
     s2 = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(date_debut, date_fin)
         .filterBounds(zone)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 40)) # Plus tolérant vu qu'on masque
+        .map(mask_s2_clouds)
     )
     nb_images = s2.size().getInfo()
     if nb_images == 0:
