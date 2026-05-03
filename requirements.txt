@@ -8,6 +8,7 @@ requests
 # Google Earth Engine
 earthengine-api
 # Traitement images & NDVI
+Pillow
 numpy
 rasterio
 shapely
