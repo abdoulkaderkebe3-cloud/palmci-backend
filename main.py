@@ -34,7 +34,7 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.core.database import init_db, get_db, AnalyseNDVI, ImageSatellite, Prescription
 
@@ -384,19 +384,24 @@ def get_images(
     ).first()
 
     if cached:
-        return {
-            "source":      "cache",
-            "site_id":     site_id,
-            "nom":         site["nom"],
-            "annee":       annee,
-            "images": {
-                "rgb":          cached.url_rgb,
-                "ndvi":         cached.url_ndvi,
-                "infrarouge":   cached.url_infrarouge,
-                "prescription": cached.url_prescription,
-            },
-            "date_calcul": cached.date_calcul,
-        }
+        age_heures = (datetime.utcnow() - cached.date_calcul).total_seconds() / 3600
+        if age_heures > 24:
+            # L'URL GEE expire au bout de 1 à 2 jours. On force le recalcul.
+            cached = None
+        else:
+            return {
+                "source":      "cache",
+                "site_id":     site_id,
+                "nom":         site["nom"],
+                "annee":       annee,
+                "images": {
+                    "rgb":          cached.url_rgb,
+                    "ndvi":         cached.url_ndvi,
+                    "infrarouge":   cached.url_infrarouge,
+                    "prescription": cached.url_prescription,
+                },
+                "date_calcul": cached.date_calcul,
+            }
 
     # 2. GEE si pas en cache
     periode = PERIODES[annee]
