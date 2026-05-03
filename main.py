@@ -199,10 +199,10 @@ def url_to_base64(url: str) -> str:
     try:
         response = requests.get(url, timeout=60)
         response.raise_for_status()
-        # Recompression JPEG qualité 75 pour réduire la taille de ~70%
+        # Recompression JPEG qualité 95 pour une qualité quasi-parfaite
         img = PILImage.open(io.BytesIO(response.content)).convert("RGB")
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=75, optimize=True)
+        img.save(buf, format="JPEG", quality=95, optimize=True)
         return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode('utf-8')
     except Exception as e:
         print(f"Erreur téléchargement image GEE: {e}")
@@ -210,20 +210,20 @@ def url_to_base64(url: str) -> str:
 
 def calculer_images_gee(composite, zones_img, zone) -> dict:
     url_rgb = composite.select(["B4", "B3", "B2"]).getThumbURL({
-        "min": 0, "max": 3000, "dimensions": 400,
+        "min": 0, "max": 3000, "dimensions": 512,
         "region": zone, "format": "jpg"
     })
     url_ndvi = composite.select("NDVI").getThumbURL({
-        "min": 0, "max": 1, "dimensions": 400,
+        "min": 0, "max": 1, "dimensions": 512,
         "region": zone, "format": "jpg",
         "palette": ["red", "yellow", "green"]
     })
     url_infrarouge = composite.select(["B8", "B4", "B3"]).getThumbURL({
-        "min": 0, "max": 4000, "dimensions": 400,
+        "min": 0, "max": 4000, "dimensions": 512,
         "region": zone, "format": "jpg"
     })
     url_prescription = zones_img.getThumbURL({
-        "min": 1, "max": 3, "dimensions": 400,
+        "min": 1, "max": 3, "dimensions": 512,
         "region": zone, "format": "jpg",
         "palette": ["#e74c3c", "#f39c12", "#27ae60"]
     })
@@ -410,10 +410,11 @@ def get_images(
     ).first()
 
     if cached:
-        # Invalider si ancienne URL GEE (expirée) ou encore PNG (non compressé)
+        # Invalider si ancienne URL GEE (expirée), encore PNG, ou JPEG basse qualité (avant le correctif HD)
         if cached.url_rgb and (
             not cached.url_rgb.startswith("data:image") or
-            cached.url_rgb.startswith("data:image/png")  # Forcer recompression en JPEG
+            cached.url_rgb.startswith("data:image/png") or
+            cached.date_calcul < datetime(2026, 5, 3, 2, 0)  # Forcer le passage en JPEG 95%
         ):
             cached = None
         else:
